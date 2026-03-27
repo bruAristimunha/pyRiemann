@@ -1,8 +1,14 @@
 """Geodesics for SPD/HPD matrices."""
-import numpy as np
-from scipy.linalg import eigvalsh
 
-from .base import _recursive, ctranspose, sqrtm, invsqrtm, powm, logm, expm
+from ._backend import (
+    broadcast_shapes,
+    check_matrix_pair,
+    diag_indices,
+    get_namespace,
+    tril_indices,
+    xpd,
+)
+from .base import ctranspose, sqrtm, invsqrtm, powm, logm, expm
 from .utils import check_function
 
 
@@ -51,7 +57,8 @@ def geodesic_chol(A, B, alpha=0.5):
         I.L. Dryden, A. Koloydenko, D. Zhou.
         Ann Appl Stat, 2009, 3(3), pp. 1102-1123.
     """
-    geo = (1 - alpha) * np.linalg.cholesky(A) + alpha * np.linalg.cholesky(B)
+    xp = get_namespace(A, B)
+    geo = (1 - alpha) * xp.linalg.cholesky(A) + alpha * xp.linalg.cholesky(B)
     return geo @ ctranspose(geo)
 
 
@@ -123,15 +130,18 @@ def geodesic_logchol(A, B, alpha=0.5):
         <https://arxiv.org/pdf/1908.09326>`_
         Z. Lin. SIAM J Matrix Anal Appl, 2019, 40(4), pp. 1353-1370.
     """
-    A_chol, B_chol = np.linalg.cholesky(A), np.linalg.cholesky(B)
+    xp = get_namespace(A, B)
+    A_chol, B_chol = xp.linalg.cholesky(A), xp.linalg.cholesky(B)
 
-    geo = np.zeros_like(A)
+    batch_shape = broadcast_shapes(A_chol.shape[:-2], B_chol.shape[:-2])
+    geo = xp.zeros(batch_shape + A_chol.shape[-2:], dtype=A_chol.dtype,
+                   device=xpd(A_chol))
 
-    tri0, tri1 = np.tril_indices(A_chol.shape[-1], -1)
+    tri0, tri1 = tril_indices(A_chol.shape[-1], -1, xp=xp, like=A_chol)
     geo[..., tri0, tri1] = (1 - alpha) * A_chol[..., tri0, tri1] + \
         alpha * B_chol[..., tri0, tri1]
 
-    diag0, diag1 = np.diag_indices(A_chol.shape[-1])
+    diag0, diag1 = diag_indices(A_chol.shape[-1], xp=xp, like=A_chol)
     geo[..., diag0, diag1] = A_chol[..., diag0, diag1] ** (1 - alpha) * \
         B_chol[..., diag0, diag1] ** alpha
 
@@ -177,7 +187,10 @@ def geodesic_logeuclid(A, B, alpha=0.5):
         V. Arsigny, P. Fillard, X. Pennec, N. Ayache.
         SIAM J Matrix Anal Appl, 2007, 29 (1), pp. 328-347
     """
-    return expm((1 - alpha) * logm(A) + alpha * logm(B))
+    return expm(
+        (1 - alpha) * logm(A) +
+        alpha * logm(B),
+    )
 
 
 def geodesic_riemann(A, B, alpha=0.5):
@@ -219,7 +232,8 @@ def geodesic_riemann(A, B, alpha=0.5):
         R. Bhatia and J. Holbrook.
         Linear Algebra and its Applications, 2006
     """
-    sA, isA = sqrtm(A), invsqrtm(A)
+    sA = sqrtm(A)
+    isA = invsqrtm(A)
     C = sA @ powm(isA @ B @ isA, alpha) @ sA
     return C
 
@@ -264,27 +278,29 @@ def geodesic_thompson(A, B, alpha=0.5):
         C. Mostajeran, N. Da Costa, G. Van Goffrier and R. Sepulchre.
         SIAM Journal on Matrix Analysis and Applications, 2024
     """
-    A_ndim = A.ndim
-    while A.ndim < 3:
-        A, B = A[np.newaxis, ...], B[np.newaxis, ...]
-    E = _recursive(eigvalsh, B, A)
-    Emin, Emax = E.min(axis=-1), E.max(axis=-1)
+    xp = check_matrix_pair(A, B, require_square=True)
+    Ainvsqrt = invsqrtm(A)
+    E = xp.linalg.eigvalsh(Ainvsqrt @ B @ Ainvsqrt)
+    Emin = xp.min(E, axis=-1)
+    Emax = xp.max(E, axis=-1)
+    mask = xp.isclose(Emin, Emax)
 
-    C = np.zeros_like(A)
+    Emin_a = Emin ** alpha
+    Emax_a = Emax ** alpha
+    a = Emax * Emin_a - Emin * Emax_a
+    b = Emax_a - Emin_a
+    den = Emax - Emin
+    den_safe = xp.where(
+        mask,
+        xp.asarray(1, dtype=den.dtype, device=xpd(den)),
+        den,
+    )
 
-    mask = (Emin == Emax)
-    C[mask] = (Emin[mask][..., np.newaxis, np.newaxis] ** alpha) * A[mask]
-
-    Emin_a, Emax_a = Emin ** alpha, Emax ** alpha
-    b = (Emax_a - Emin_a)[~mask][..., np.newaxis, np.newaxis]
-    a = (Emax * Emin_a - Emin * Emax_a)[~mask][..., np.newaxis, np.newaxis]
-    c = b * B[~mask] + a * A[~mask]
-    C[~mask] = c / (Emax - Emin)[~mask][..., np.newaxis, np.newaxis]
-
-    if A_ndim < 3:
-        C = C[0]
-
-    return C
+    C_equal = Emin_a[..., None, None] * A
+    C_general = (
+        b[..., None, None] * B + a[..., None, None] * A
+    ) / den_safe[..., None, None]
+    return xp.where(mask[..., None, None], C_equal, C_general)
 
 
 def geodesic_wasserstein(A, B, alpha=0.5):

@@ -1,9 +1,9 @@
 import inspect
 
-import numpy as np
+from ._backend import get_namespace, xpd
 
 
-def check_weights(weights, n_weights, *, check_positivity=False):
+def check_weights(weights, n_weights, *, check_positivity=False, like=None):
     """Check weights.
 
     If input is None, output weights are equal.
@@ -28,24 +28,27 @@ def check_weights(weights, n_weights, *, check_positivity=False):
     -----
     .. versionadded:: 0.4
     """
+    xp = get_namespace(like)
+    dtype = None if like is None else like.real.dtype
+
     if weights is None:
-        weights = np.ones(n_weights)
+        weights = xp.ones(n_weights, dtype=dtype, device=xpd(like) if like is not None else None)
 
     else:
-        weights = np.asarray(weights)
+        weights = xp.asarray(weights, dtype=dtype, device=xpd(like) if like is not None else None)
         if weights.shape != (n_weights,):
             raise ValueError(
                 "Weights do not have the good shape. Should be (%d,) but got "
                 "%s." % (n_weights, weights.shape,)
             )
-        if check_positivity and any(weights <= 0):
+        if check_positivity and bool(xp.any(weights <= 0)):
             raise ValueError("Weights must be strictly positive.")
 
-    weights /= np.sum(weights)
+    weights = weights / xp.sum(weights)
     return weights
 
 
-def check_metric(metric, expected_keys=["mean", "distance"]):
+def check_metric(metric, expected_keys=None):
     """Check metric argument.
 
     Parameters
@@ -68,6 +71,9 @@ def check_metric(metric, expected_keys=["mean", "distance"]):
     -----
     .. versionadded:: 0.6
     """
+    if expected_keys is None:
+        expected_keys = ["mean", "distance"]
+
     if isinstance(metric, str):
         return [metric] * len(expected_keys)
 
@@ -113,13 +119,13 @@ def check_function(fun, functions):
                              f"{' '.join(functions.keys())}")
         else:
             fun = functions[fun]
-    elif not hasattr(fun, '__call__'):
+    elif not callable(fun):
         raise ValueError("Argument must be a string or a callable "
                          f"(Got {type(fun)}).")
     return fun
 
 
-def check_init(init, n):
+def check_init(init, n, *, like=None):
     """Check the initial matrix.
 
     Parameters
@@ -138,7 +144,9 @@ def check_init(init, n):
     -----
     .. versionadded:: 0.8
     """
-    init = np.asarray(init)
+    xp = get_namespace(like)
+    dtype = None if like is None else like.dtype
+    init = xp.asarray(init, dtype=dtype, device=xpd(like) if like is not None else None)
     if init.shape != (n, n):
         raise ValueError(
             "Init matrix does not have the good shape. "

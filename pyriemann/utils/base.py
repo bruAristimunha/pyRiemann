@@ -1,8 +1,10 @@
 """Base functions for SPD/HPD matrices."""
 
+from functools import wraps
+
 import numpy as np
 
-from .test import is_pos_def
+from ._backend import get_namespace, xpd
 
 
 def ctranspose(X):
@@ -14,7 +16,7 @@ def ctranspose(X):
     Parameters
     ----------
     X : ndarray, shape (..., n, m)
-        Matrices, at least 2D ndarray.
+        Matrices.
 
     Returns
     -------
@@ -29,7 +31,38 @@ def ctranspose(X):
     ----------
     .. [1] https://en.wikipedia.org/wiki/Conjugate_transpose
     """
-    return np.swapaxes(X.conj(), -2, -1)
+    xp = get_namespace(X)
+    return xp.conj(X).mT
+
+
+def _vectorize_nd(n_axes=2):
+    """Decorator to vectorize a function over leading batch dimensions.
+
+    Parameters
+    ----------
+    n_axes : int, default=2
+        Number of trailing axes that form the core dimensions:
+
+        - n_axes=2: (..., n1, n2) -> func(n1, n2) -> (..., m1, m2)
+        - n_axes=3: (..., n1, n2, n3) -> func(n1, n2, n3) -> (..., m1, m2)
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(X, *args, **kwargs):
+            batch_shape = X.shape[:-n_axes]
+            if len(batch_shape) == 0:
+                return func(X, *args, **kwargs)
+            xp = get_namespace(X)
+            n_batch = int(np.prod(batch_shape))
+            core_shape = X.shape[-n_axes:]
+            X_flat = xp.reshape(X, (n_batch, *core_shape))
+            X_new = xp.stack(
+                [func(X_flat[b], *args, **kwargs) for b in range(n_batch)],
+                axis=0,
+            )
+            return xp.reshape(X_new, (*batch_shape, *X_new.shape[1:]))
+        return wrapper
+    return decorator
 
 
 ###############################################################################
@@ -40,25 +73,30 @@ def _recursive(fun, A, B, *args, **kwargs):
     if A.ndim == 2:
         return fun(A, B, *args, **kwargs)
     else:
-        return np.asarray(
-            [_recursive(fun, a, b, *args, **kwargs) for a, b in zip(A, B)]
+        xp = get_namespace(A)
+        return xp.stack(
+            [_recursive(fun, a, b, *args, **kwargs) for a, b in zip(A, B)],
+            axis=0,
         )
 
 
 def _matrix_operator(X, operator):
     """Matrix function for SPD/HPD matrices."""
-    if not isinstance(X, np.ndarray) or X.ndim < 2:
-        raise ValueError("Input must be at least a 2D ndarray")
-    if X.dtype.char in np.typecodes['AllFloat'] and (
-            np.isinf(X).any() or np.isnan(X).any()):
+    xp = get_namespace(X)
+    if not hasattr(X, "ndim") or X.ndim < 2:
+        raise ValueError("Input must be at least a 2D ndarray or tensor")
+    if X.shape[-2] != X.shape[-1]:
+        raise ValueError("Input must contain square matrices")
+    if xp.isdtype(X.dtype, ("real floating", "complex floating")) \
+            and not bool(xp.all(xp.isfinite(X))):
         raise ValueError(
             "Matrices must be positive definite. "
             "You should add regularization to avoid this error."
         )
 
-    eigvals, eigvecs = np.linalg.eigh(X)
+    eigvals, eigvecs = xp.linalg.eigh(X)
     eigvals = operator(eigvals)
-    X_new = eigvecs @ (np.expand_dims(eigvals, -1) * ctranspose(eigvecs))
+    X_new = eigvecs @ (eigvals[..., None] * ctranspose(eigvecs))
     return X_new
 
 
@@ -77,14 +115,15 @@ def expm(C):
     Parameters
     ----------
     C : ndarray, shape (..., n, n)
-        SPD/HPD matrices, at least 2D ndarray.
+        SPD/HPD matrices.
 
     Returns
     -------
     D : ndarray, shape (..., n, n)
         Matrix exponential of C.
     """
-    return _matrix_operator(C, np.exp)
+    xp = get_namespace(C)
+    return _matrix_operator(C, xp.exp)
 
 
 def invsqrtm(C):
@@ -103,14 +142,18 @@ def invsqrtm(C):
     Parameters
     ----------
     C : ndarray, shape (..., n, n)
-        SPD/HPD matrices, at least 2D ndarray.
+        SPD/HPD matrices.
 
     Returns
     -------
     D : ndarray, shape (..., n, n)
         Matrix inverse square root of C.
     """
-    def isqrt(x): return 1. / np.sqrt(x)
+    xp = get_namespace(C)
+
+    def isqrt(x):
+        return 1. / xp.sqrt(x)
+
     return _matrix_operator(C, isqrt)
 
 
@@ -129,14 +172,15 @@ def logm(C):
     Parameters
     ----------
     C : ndarray, shape (..., n, n)
-        SPD/HPD matrices, at least 2D ndarray.
+        SPD/HPD matrices.
 
     Returns
     -------
     D : ndarray, shape (..., n, n)
         Matrix logarithm of C.
     """
-    return _matrix_operator(C, np.log)
+    xp = get_namespace(C)
+    return _matrix_operator(C, xp.log)
 
 
 def powm(C, alpha):
@@ -155,7 +199,7 @@ def powm(C, alpha):
     Parameters
     ----------
     C : ndarray, shape (..., n, n)
-        SPD/HPD matrices, at least 2D ndarray.
+        SPD/HPD matrices.
     alpha : float
         The power to apply.
 
@@ -184,60 +228,18 @@ def sqrtm(C):
     Parameters
     ----------
     C : ndarray, shape (..., n, n)
-        SPD/HPD matrices, at least 2D ndarray.
+        SPD/HPD matrices.
 
     Returns
     -------
     D : ndarray, shape (..., n, n)
         Matrix square root of C.
     """
-    return _matrix_operator(C, np.sqrt)
+    xp = get_namespace(C)
+    return _matrix_operator(C, xp.sqrt)
 
 
 ###############################################################################
-
-
-def _nearest_sym_pos_def(S, reg=1e-6):
-    """Find the nearest SPD matrix.
-
-    Parameters
-    ----------
-    S : ndarray, shape (n, n)
-        Square matrix.
-    reg : float, default=1e-6
-        Regularization parameter.
-
-    Returns
-    -------
-    P : ndarray, shape (n, n)
-        Nearest SPD matrix.
-    """
-    def regularize(X, reg):
-        ei, ev = np.linalg.eigh(X)
-        if np.min(ei) / np.max(ei) < reg:
-            X = ev @ np.diag(ei + reg) @ ev.T
-        return X
-
-    A = (S + S.T) / 2
-    _, s, V = np.linalg.svd(A)
-    H = V.T @ (s[:, np.newaxis] * V)
-    B = (A + H) / 2
-    P = (B + B.T) / 2
-
-    if is_pos_def(P):
-        # Regularize if already PD
-        return regularize(P, reg)
-
-    spacing = np.spacing(np.linalg.norm(A))
-    I = np.eye(S.shape[0])  # noqa
-    k = 1
-    while not is_pos_def(P, fast_mode=False):
-        mineig = np.min(np.real(np.linalg.eigvals(P)))
-        P += I * (-mineig * k ** 2 + spacing)
-        k += 1
-
-    # Regularize
-    return regularize(P, reg)
 
 
 def nearest_sym_pos_def(X, reg=1e-6):
@@ -248,14 +250,14 @@ def nearest_sym_pos_def(X, reg=1e-6):
 
     Parameters
     ----------
-    X : ndarray, shape (n_matrices, n, n)
+    X : ndarray, shape (..., n, n)
         Square matrices.
     reg : float, default=1e-6
         Regularization parameter.
 
     Returns
     -------
-    P : ndarray, shape (n_matrices, n, n)
+    P : ndarray, shape (..., n, n)
         Nearest SPD matrices.
 
     Notes
@@ -271,7 +273,46 @@ def nearest_sym_pos_def(X, reg=1e-6):
         <https://www.sciencedirect.com/science/article/pii/0024379588902236>`_
         N.J. Higham, Linear Algebra and its Applications, vol 103, 1988
     """
-    return np.array([_nearest_sym_pos_def(x, reg) for x in X])
+    n = X.shape[-1]
+
+    # Symmetrize
+    A = (X + X.mT) / 2
+
+    _, s, Vh = np.linalg.svd(A)
+    H = Vh.mT @ (s[..., :, np.newaxis] * Vh)
+    B = (A + H) / 2
+    P = (B + B.mT) / 2
+
+    # PD fix: iteratively shift non-PD matrices
+    eigvals = np.linalg.eigvalsh(P)
+    neg_ev = np.any(eigvals <= 0, axis=-1)  # (...,)
+
+    if np.any(neg_ev):
+        spacing = np.spacing(np.linalg.norm(A, axis=(-2, -1)))
+        I = np.eye(n)  # noqa
+        k = 1
+        while np.any(neg_ev) and k < 100:
+            mineig = np.min(np.linalg.eigvalsh(P), axis=-1)
+            shift = np.where(
+                neg_ev, -mineig * k**2 + spacing, 0.0,
+            )
+            P = P + shift[..., np.newaxis, np.newaxis] * I
+            eigvals = np.linalg.eigvalsh(P)
+            neg_ev = np.any(eigvals <= 0, axis=-1)
+            k += 1
+
+    # Regularize
+    ei, ev = np.linalg.eigh(P)
+    ratio = np.min(ei, axis=-1) / np.max(ei, axis=-1)
+    needs_reg = ratio < reg  # (...,)
+    if np.any(needs_reg):
+        ei_reg = ei + reg
+        P_reg = ev @ (ei_reg[..., :, np.newaxis] * ev.mT)
+        P = np.where(
+            needs_reg[..., np.newaxis, np.newaxis], P_reg, P,
+        )
+
+    return P
 
 
 ###############################################################################
@@ -280,8 +321,8 @@ def nearest_sym_pos_def(X, reg=1e-6):
 def _first_divided_difference(d, fct, fctder, atol=1e-12, rtol=1e-12):
     r"""First divided difference of a matrix function.
 
-    First divided difference of a matrix function applied to the eigenvalues
-    of a symmetric matrix. The first divided difference is defined as [1]_:
+    The first divided difference of a matrix function applied to the
+    eigenvalues :math:`\mathbf{d}` of a symmetric matrix is [1]_:
 
     .. math::
        [FDD(d)]_{i,j} =
@@ -292,17 +333,16 @@ def _first_divided_difference(d, fct, fctder, atol=1e-12, rtol=1e-12):
            & d_i = d_j
            \end{cases}
 
-
     Parameters
     ----------
-    d : ndarray, shape (n,)
-        Eigenvalues of a symmetric matrix.
+    d : ndarray, shape (..., n)
+        Eigenvalues of symmetric matrices.
     fct : callable
-        Function to apply to eigenvalues of d. Has to be defined for all
-        possible eigenvalues of d.
+        Function to apply to eigenvalues d. Has to be defined for all
+        possible eigenvalues d.
     fctder : callable
         Derivative of the function to apply. Has to be defined for all
-        possible eigenvalues of d.
+        possible eigenvalues d.
     atol : float, default=1e-12
         Absolute tolerance for equality of eigenvalues.
     rtol : float, default=1e-12
@@ -310,7 +350,7 @@ def _first_divided_difference(d, fct, fctder, atol=1e-12, rtol=1e-12):
 
     Returns
     -------
-    FDD : ndarray, shape (n, n)
+    FDD : ndarray, shape (..., n, n)
         First divided difference of the function applied to the eigenvalues.
 
     Notes
@@ -322,13 +362,21 @@ def _first_divided_difference(d, fct, fctder, atol=1e-12, rtol=1e-12):
     .. [1] `Matrix  Analysis <https://doi.org/10.1007/978-1-4612-0653-8>`_
         R. Bhatia, Springer, 1997
     """
-    dif = np.repeat(d[None, :], len(d), axis=0)
-
-    close_ = np.isclose(dif, dif.T, atol=atol, rtol=rtol)
-    dif[close_] = fctder(dif[close_])
-    dif[~close_] = (fct(dif[~close_]) - fct(dif.T[~close_])) / \
-                   (dif[~close_] - dif.T[~close_])
-    return dif
+    xp = get_namespace(d)
+    di = d[..., :, None]
+    dj = d[..., None, :]
+    close_ = xp.isclose(di, dj, atol=atol, rtol=rtol)
+    den = di - dj
+    den_safe = xp.where(
+        close_,
+        xp.asarray(1, dtype=den.dtype, device=xpd(den)),
+        den,
+    )
+    return xp.where(
+        close_,
+        fctder(di),
+        (fct(di) - fct(dj)) / den_safe,
+    )
 
 
 def ddexpm(X, Cref):
@@ -369,10 +417,15 @@ def ddexpm(X, Cref):
     .. [1] `Matrix  Analysis <https://doi.org/10.1007/978-1-4612-0653-8>`_
         R. Bhatia, Springer, 1997
     """
-
-    d, V = np.linalg.eigh(Cref)
-    expfdd = _first_divided_difference(d, np.exp, np.exp)
-    return V @ (expfdd * (V.conj().T @ X @ V)) @ V.conj().T
+    xp = get_namespace(X, Cref)
+    d, V = xp.linalg.eigh(Cref)
+    expfdd = _first_divided_difference(
+        d,
+        xp.exp,
+        xp.exp,
+    )
+    Vh = ctranspose(V)
+    return V @ (expfdd * (Vh @ X @ V)) @ Vh
 
 
 def ddlogm(X, Cref):
@@ -413,7 +466,12 @@ def ddlogm(X, Cref):
     .. [1] `Matrix  Analysis <https://doi.org/10.1007/978-1-4612-0653-8>`_
         R. Bhatia, Springer, 1997
     """
-
-    d, V = np.linalg.eigh(Cref)
-    logfdd = _first_divided_difference(d, np.log, lambda x: 1 / x)
-    return V @ (logfdd * (V.conj().T @ X @ V)) @ V.conj().T
+    xp = get_namespace(X, Cref)
+    d, V = xp.linalg.eigh(Cref)
+    logfdd = _first_divided_difference(
+        d,
+        xp.log,
+        lambda x: 1 / x,
+    )
+    Vh = ctranspose(V)
+    return V @ (logfdd * (Vh @ X @ V)) @ Vh

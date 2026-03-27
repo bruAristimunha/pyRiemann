@@ -1,9 +1,17 @@
 """Distances between SPD/HPD matrices."""
 
 import numpy as np
-from scipy.linalg import eigvalsh, solve
+from scipy.linalg import eigvalsh
 from sklearn.metrics import euclidean_distances
 
+from ._backend import (
+    check_matrix_pair,
+    diag_indices,
+    get_namespace,
+    is_numpy_namespace,
+    tril_indices,
+    xpd,
+)
 from .base import _recursive, invsqrtm, logm, powm, sqrtm
 from .test import is_real_type
 from .utils import check_function
@@ -16,6 +24,10 @@ def _check_inputs(A, B):
         raise ValueError("Inputs must have equal dimensions")
     if A.ndim < 2:
         raise ValueError("Inputs must be at least a 2D ndarray")
+
+
+def _last_axis_norm2(x, xp):
+    return xp.sum(xp.abs(x) ** 2, axis=-1)
 
 
 ###############################################################################
@@ -62,9 +74,10 @@ def distance_chol(A, B, squared=False):
         I.L. Dryden, A. Koloydenko, D. Zhou.
         Ann Appl Stat, 2009, 3(3), pp. 1102-1123.
     """
+    xp = get_namespace(A, B)
     return distance_euclid(
-        np.linalg.cholesky(A),
-        np.linalg.cholesky(B),
+        xp.linalg.cholesky(A),
+        xp.linalg.cholesky(B),
         squared=squared,
     )
 
@@ -99,8 +112,8 @@ def distance_euclid(A, B, squared=False):
     --------
     distance
     """
-    _check_inputs(A, B)
-    d = np.linalg.norm(A - B, ord="fro", axis=(-2, -1))
+    xp = check_matrix_pair(A, B)
+    d = xp.linalg.matrix_norm(A - B)
     return d ** 2 if squared else d
 
 
@@ -134,7 +147,13 @@ def distance_harmonic(A, B, squared=False):
     --------
     distance
     """
-    return distance_euclid(np.linalg.inv(A), np.linalg.inv(B), squared=squared)
+    xp = get_namespace(A, B)
+    eye_n = xp.eye(A.shape[-1], dtype=A.dtype, device=xpd(A))
+    return distance_euclid(
+        xp.linalg.solve(A, eye_n),
+        xp.linalg.solve(B, eye_n),
+        squared=squared,
+    )
 
 
 def distance_kullback(A, B, squared=False):
@@ -175,11 +194,11 @@ def distance_kullback(A, B, squared=False):
         S. Kullback S, R. Leibler.
         The Annals of Mathematical Statistics, 1951, 22 (1), pp. 79-86
     """
-    _check_inputs(A, B)
+    xp = check_matrix_pair(A, B, require_square=True)
     n = A.shape[-1]
-    tr = np.trace(_recursive(solve, B, A, assume_a='pos'), axis1=-2, axis2=-1)
-    logdet = np.linalg.slogdet(B)[1] - np.linalg.slogdet(A)[1]
-    d = 0.5 * (tr - n + logdet).real
+    tr = xp.sum(xp.linalg.diagonal(xp.linalg.inv(B) @ A), axis=-1)
+    logdet = xp.linalg.slogdet(B)[1] - xp.linalg.slogdet(A)[1]
+    d = 0.5 * xp.real(tr - n + logdet)
     return d ** 2 if squared else d
 
 
@@ -224,7 +243,10 @@ def distance_kullback_sym(A, B, squared=False):
         Proceedings of the Royal Society of London A: mathematical, physical
         and engineering sciences, 1946, 186 (1007), pp. 453-461
     """
-    d = distance_kullback(A, B) + distance_kullback_right(A, B)
+    d = distance_kullback(A, B) + distance_kullback_right(
+        A,
+        B,
+    )
     return d ** 2 if squared else d
 
 
@@ -271,23 +293,24 @@ def distance_logchol(A, B, squared=False):
         <https://arxiv.org/pdf/1908.09326>`_
         Z. Lin. SIAM J Matrix Anal Appl, 2019, 40(4), pp. 1353-1370.
     """
-    _check_inputs(A, B)
-    A_chol, B_chol = np.linalg.cholesky(A), np.linalg.cholesky(B)
+    xp = check_matrix_pair(A, B)
+    A_chol, B_chol = xp.linalg.cholesky(A), xp.linalg.cholesky(B)
 
-    tri0, tri1 = np.tril_indices(A_chol.shape[-1], -1)
-    triagular_part = np.linalg.norm(
+    tri0, tri1 = tril_indices(A_chol.shape[-1], -1, xp=xp, like=A_chol)
+    triangular_part = _last_axis_norm2(
         A_chol[..., tri0, tri1] - B_chol[..., tri0, tri1],
-        axis=-1,
-    ) ** 2
+        xp,
+    )
 
-    diag0, diag1 = np.diag_indices(A_chol.shape[-1])
-    diagonal_part = np.linalg.norm(
-        np.log(A_chol[..., diag0, diag1]) - np.log(B_chol[..., diag0, diag1]),
-        axis=-1,
-    ) ** 2
+    diag0, diag1 = diag_indices(A_chol.shape[-1], xp=xp, like=A_chol)
+    diagonal_part = _last_axis_norm2(
+        xp.log(A_chol[..., diag0, diag1]) -
+        xp.log(B_chol[..., diag0, diag1]),
+        xp,
+    )
 
-    d2 = triagular_part + diagonal_part
-    return d2 if squared else np.sqrt(d2)
+    d2 = triangular_part + diagonal_part
+    return d2 if squared else xp.sqrt(d2)
 
 
 def distance_logdet(A, B, squared=False):
@@ -328,12 +351,12 @@ def distance_logdet(A, B, squared=False):
         I.S. Dhillon, J.A. Tropp.
         SIAM J Matrix Anal Appl, 2007, 29 (4), pp. 1120-1146
     """
-    _check_inputs(A, B)
-    logdet_ApB = np.linalg.slogdet((A + B) / 2.0)[1]
-    logdet_AxB = np.linalg.slogdet(A @ B)[1]
+    xp = check_matrix_pair(A, B, require_square=True)
+    logdet_ApB = xp.linalg.slogdet((A + B) / 2.0)[1]
+    logdet_AxB = xp.linalg.slogdet(A @ B)[1]
     d2 = logdet_ApB - 0.5 * logdet_AxB
-    d2 = np.maximum(0, d2)
-    return d2 if squared else np.sqrt(d2)
+    d2 = xp.maximum(xp.real(d2), xp.asarray(0, dtype=d2.dtype, device=xpd(d2)))
+    return d2 if squared else xp.sqrt(d2)
 
 
 def distance_logeuclid(A, B, squared=False):
@@ -374,7 +397,11 @@ def distance_logeuclid(A, B, squared=False):
         V. Arsigny, P. Fillard, X. Pennec, N. Ayache.
         SIAM J Matrix Anal Appl, 2007, 29 (1), pp. 328-347
     """
-    return distance_euclid(logm(A), logm(B), squared=squared)
+    return distance_euclid(
+        logm(A),
+        logm(B),
+        squared=squared,
+    )
 
 
 def distance_poweuclid(A, B, p, squared=False):
@@ -477,9 +504,14 @@ def distance_riemann(A, B, squared=False):
         W. Förstner & B. Moonen.
         Geodesy-the Challenge of the 3rd Millennium, 2003
     """
-    _check_inputs(A, B)
-    d2 = (np.log(_recursive(eigvalsh, A, B))**2).sum(axis=-1)
-    return d2 if squared else np.sqrt(d2)
+    xp = check_matrix_pair(A, B)
+    if is_numpy_namespace(xp) and A.shape == B.shape:
+        d2 = (np.log(_recursive(eigvalsh, A, B))**2).sum(axis=-1)
+    else:
+        Binv12 = invsqrtm(B)
+        eigvals = xp.linalg.eigvalsh(Binv12 @ A @ Binv12)
+        d2 = xp.sum(xp.log(eigvals) ** 2, axis=-1)
+    return d2 if squared else xp.sqrt(d2)
 
 
 def distance_thompson(A, B, squared=False):
@@ -524,8 +556,10 @@ def distance_thompson(A, B, squared=False):
         <https://www.cs.umd.edu/projects/reucaar/ThompsonGeom.pdf>`_
         A.C.Thompson. Proceedings of the American Mathematical Society, 1963.
     """
-    _check_inputs(A, B)
-    d = (np.abs(np.log(_recursive(eigvalsh, A, B)))).max(axis=-1)
+    xp = check_matrix_pair(A, B, require_square=True)
+    Binv12 = invsqrtm(B)
+    eigvals = xp.linalg.eigvalsh(Binv12 @ A @ Binv12)
+    d = xp.max(xp.abs(xp.log(eigvals)), axis=-1)
     return d ** 2 if squared else d
 
 
@@ -570,11 +604,16 @@ def distance_wasserstein(A, B, squared=False):
         <https://www.ams.org/journals/tran/1969-135-00/S0002-9947-1969-0236719-2/S0002-9947-1969-0236719-2.pdf>`_
         D. Bures. Trans Am Math Soc, 1969, 135, pp. 199-212
     """  # noqa
-    _check_inputs(A, B)
+    xp = check_matrix_pair(A, B)
     B12 = sqrtm(B)
-    d2 = np.trace(A + B - 2 * sqrtm(B12 @ A @ B12), axis1=-2, axis2=-1)
-    d2 = np.maximum(0, d2.real)
-    return d2 if squared else np.sqrt(d2)
+    d2 = xp.sum(
+        xp.linalg.diagonal(A + B - 2 * sqrtm(B12 @ A @ B12)),
+        axis=-1,
+    )
+    real_d2 = xp.real(d2)
+    zero = xp.asarray(0, dtype=real_d2.dtype, device=xpd(d2))
+    d2 = xp.maximum(real_d2, zero)
+    return d2 if squared else xp.sqrt(d2)
 
 
 distance_functions = {
@@ -590,6 +629,21 @@ distance_functions = {
     "riemann": distance_riemann,
     "thompson": distance_thompson,
     "wasserstein": distance_wasserstein,
+}
+
+_BROADCASTABLE_DISTANCE_FUNCTIONS = {
+    distance_chol,
+    distance_euclid,
+    distance_harmonic,
+    distance_kullback,
+    distance_kullback_right,
+    distance_kullback_sym,
+    distance_logchol,
+    distance_logdet,
+    distance_logeuclid,
+    distance_riemann,
+    distance_thompson,
+    distance_wasserstein,
 }
 
 
@@ -645,14 +699,21 @@ def distance(A, B, metric="riemann", squared=False):
         Neuroinformatics, Springer, 2021, 19 (1), pp.93-106
     """
     distance_function = check_function(metric, distance_functions)
+    xp = get_namespace(A, B)
 
     shape_A, shape_B = A.shape, B.shape
     if shape_A == shape_B:
         d = distance_function(A, B, squared=squared)
     elif len(shape_A) == 3 and len(shape_B) == 2:
-        d = np.empty((shape_A[0], 1))
-        for i in range(shape_A[0]):
-            d[i] = distance_function(A[i], B, squared=squared)
+        if distance_function in _BROADCASTABLE_DISTANCE_FUNCTIONS:
+            d = distance_function(A, B, squared=squared)
+        else:
+            d = xp.stack(
+                [distance_function(A[i], B, squared=squared)
+                 for i in range(shape_A[0])],
+                axis=0,
+            )
+        d = d[..., None]
     else:
         raise ValueError("Inputs have incompatible dimensions.")
 
@@ -737,12 +798,14 @@ def _pairwise_distance_harmonic(X, Y=None, squared=False):
     pairwise_distance
     distance_harmonic
     """
+    eye_n = np.eye(X.shape[-1])
     if Y is None:
-        invY = None
+        Y_inv = None
     else:
-        invY = np.linalg.inv(Y)
+        Y_inv = np.linalg.solve(Y, eye_n)
 
-    return _pairwise_distance_euclid(np.linalg.inv(X), invY, squared=squared)
+    X_inv = np.linalg.solve(X, eye_n)
+    return _pairwise_distance_euclid(X_inv, Y_inv, squared=squared)
 
 
 def _pairwise_distance_logchol(X, Y=None, squared=False):
@@ -880,7 +943,7 @@ def _pairwise_distance_riemann(X, Y=None, squared=False):
         dist[i, i * XisY:] = d2
 
     if XisY:
-        dist += dist.T
+        dist += dist.mT
 
     return dist if squared else np.sqrt(dist)
 
@@ -915,6 +978,33 @@ def pairwise_distance(X, Y=None, metric="riemann", squared=False):
     --------
     distance
     """
+    distance_function = check_function(metric, distance_functions)
+    xp = get_namespace(X, Y)
+    if not is_numpy_namespace(xp):
+        if Y is None:
+            Y_ = X
+        else:
+            Y_ = Y
+        if distance_function in _BROADCASTABLE_DISTANCE_FUNCTIONS:
+            return distance_function(
+                X[:, None, ...],
+                Y_[None, ...],
+                squared=squared,
+            )
+        return xp.stack(
+            [
+                xp.stack(
+                    [
+                        distance_function(X[i], Y_[j], squared=squared)
+                        for j in range(len(Y_))
+                    ],
+                    axis=0,
+                )
+                for i in range(len(X))
+            ],
+            axis=0,
+        )
+
     if metric == "euclid":
         return _pairwise_distance_euclid(X, Y=Y, squared=squared)
     elif metric == "harmonic":
@@ -937,7 +1027,7 @@ def pairwise_distance(X, Y=None, metric="riemann", squared=False):
         for i in range(n_matrices_X):
             for j in range(i + 1, n_matrices_X):
                 dist[i, j] = distance(X[i], X[j], metric, squared=squared)
-        dist += dist.T
+        dist += dist.mT
     else:
         n_matrices_Y, _, _ = Y.shape
         dist = np.empty((n_matrices_X, n_matrices_Y))
@@ -965,11 +1055,11 @@ def distance_mahalanobis(X, cov, mean=None, squared=False):
 
     Parameters
     ----------
-    X : ndarray, shape (n, n_vectors)
+    X : ndarray, shape (..., n, m)
         Vectors.
-    cov : ndarray, shape (n, n)
+    cov : ndarray, shape (..., n, n)
         Covariance matrix of the multivariate Gaussian distribution.
-    mean : None | ndarray, shape (n, 1), default=None
+    mean : None | ndarray, shape (..., n, 1), default=None
         Mean vector of the multivariate Gaussian distribution.
         If None, distribution is considered as centered.
     squared : bool, default=False
@@ -979,7 +1069,7 @@ def distance_mahalanobis(X, cov, mean=None, squared=False):
 
     Returns
     -------
-    d : ndarray, shape (n_vectors,)
+    d : ndarray, shape (..., m)
         Mahalanobis distances.
 
     Notes
@@ -990,9 +1080,10 @@ def distance_mahalanobis(X, cov, mean=None, squared=False):
     ----------
     .. [1] https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.distance.mahalanobis.html
     """  # noqa
+    xp = get_namespace(X, cov, mean)
     if mean is not None:
-        X -= mean
+        X = X - mean
 
     Xw = invsqrtm(cov) @ X
-    d2 = np.einsum("ij,ji->i", Xw.conj().T, Xw).real
-    return d2 if squared else np.sqrt(d2)
+    d2 = xp.real(xp.sum(xp.conj(Xw) * Xw, axis=-2))
+    return d2 if squared else xp.sqrt(d2)

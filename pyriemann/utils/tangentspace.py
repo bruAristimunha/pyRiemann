@@ -1,16 +1,20 @@
 """Tangent space for SPD/HPD matrices."""
 
+import math
+
 import numpy as np
 
+from ._backend import (
+    check_matrix_pair,
+    create_diagonal,
+    diag_indices,
+    get_namespace,
+    tril_indices,
+    triu_indices,
+    xpd,
+)
 from .base import ctranspose, expm, invsqrtm, logm, sqrtm, ddexpm, ddlogm
 from .utils import check_function
-
-
-def _check_dimensions(X, Cref):
-    n_1, n_2 = X.shape[-2:]
-    n_3, n_4 = Cref.shape
-    if not (n_1 == n_2 == n_3 == n_4):
-        raise ValueError("Inputs have incompatible dimensions.")
 
 
 def exp_map_euclid(X, Cref):
@@ -71,24 +75,28 @@ def exp_map_logchol(X, Cref):
         <https://arxiv.org/pdf/1908.09326>`_
         Z. Lin. SIAM J Matrix Anal Appl, 2019, 40(4), pp. 1353-1370.
     """
-    Cref_chol = np.linalg.cholesky(Cref)
-    Cref_invchol = np.linalg.inv(Cref_chol)
+    xp = check_matrix_pair(X, Cref, require_square=True)
+    Cref_chol = xp.linalg.cholesky(Cref)
+    eye_n = xp.eye(Cref.shape[-1], dtype=Cref.dtype, device=xpd(Cref))
+    Cref_invchol = xp.linalg.solve(Cref_chol, eye_n)
 
-    tri0, tri1 = np.tril_indices(X.shape[-1], -1)
-    diag0, diag1 = np.diag_indices(X.shape[-1])
+    tri0, tri1 = tril_indices(X.shape[-1], -1, xp=xp, like=X)
+    diag0, diag1 = diag_indices(X.shape[-1], xp=xp, like=X)
 
-    diff_bracket = Cref_invchol @ X @ Cref_invchol.conj().T
+    diff_bracket = Cref_invchol @ X @ ctranspose(Cref_invchol)
     diff_bracket[..., tri1, tri0] = 0
     diff_bracket[..., diag0, diag1] /= 2
     diff = Cref_chol @ diff_bracket
 
-    exp_map = np.zeros_like(X)
+    exp_map = xp.zeros(diff.shape, dtype=diff.dtype, device=xpd(diff))
 
     exp_map[..., tri0, tri1] = Cref_chol[..., tri0, tri1] + \
         diff[..., tri0, tri1]
 
-    exp_map[..., diag0, diag1] = np.exp(diff_bracket[..., diag0, diag1]) \
-        * Cref_chol[..., diag0, diag1]
+    exp_map[..., diag0, diag1] = (
+        xp.exp(diff_bracket[..., diag0, diag1]) *
+        Cref_chol[..., diag0, diag1]
+    )
 
     return exp_map @ ctranspose(exp_map)
 
@@ -138,7 +146,10 @@ def exp_map_logeuclid(X, Cref):
         <https://ieeexplore.ieee.org/document/10735221>`_
         G. Wagner vom Berg, V. Röhr, D. Platt, B. Blankertz. IEEE TBME, 2024.
     """
-    return expm(logm(Cref) + ddlogm(X, Cref))
+    check_matrix_pair(X, Cref, require_square=True)
+    return expm(
+        logm(Cref) + ddlogm(X, Cref),
+    )
 
 
 def exp_map_riemann(X, Cref, Cm12=False):
@@ -184,6 +195,7 @@ def exp_map_riemann(X, Cref, Cm12=False):
         <https://link.springer.com/article/10.1007/s11263-005-3222-z>`_
         X. Pennec, P. Fillard, N. Ayache. IJCV, 2006, 66(1), pp. 41-66.
     """
+    check_matrix_pair(X, Cref, require_square=True)
     if Cm12:
         Cm12 = invsqrtm(Cref)
         X = Cm12 @ X @ Cm12
@@ -222,13 +234,15 @@ def exp_map_wasserstein(X, Cref):
         L. Malagò, L. Montrucchio, G. Pistone. Information Geometry, 2018, 1,
         pp. 137–179.
     """
-    d, V = np.linalg.eigh(Cref)
-    C = 1 / (d[:, None] + d[None, :])
+    xp = check_matrix_pair(X, Cref, require_square=True)
+    d, V = xp.linalg.eigh(Cref)
+    C = 1 / (d[..., :, None] + d[..., None, :])
+    d = xp.asarray(d, dtype=Cref.dtype, device=xpd(Cref))
 
-    X_rotated = V.conj().T @ X @ V
+    X_rotated = ctranspose(V) @ X @ V
     X_tmp = C * X_rotated
-    X_tmp = X_tmp @ np.diag(d) @ X_tmp
-    X_tmp = V @ X_tmp @ V.conj().T
+    X_tmp = X_tmp @ create_diagonal(d) @ X_tmp
+    X_tmp = V @ X_tmp @ ctranspose(V)
 
     return Cref + X + X_tmp
 
@@ -338,18 +352,31 @@ def log_map_logchol(X, Cref):
         <https://arxiv.org/pdf/1908.09326>`_
         Z. Lin. SIAM J Matrix Anal Appl, 2019, 40(4), pp. 1353-1370.
     """
-    X_chol, Cref_chol = np.linalg.cholesky(X), np.linalg.cholesky(Cref)
+    xp = check_matrix_pair(X, Cref, require_square=True)
+    X_chol = xp.linalg.cholesky(X)
+    Cref_chol = xp.linalg.cholesky(Cref)
 
-    res = np.zeros_like(X)
+    batch_shape = np.broadcast_shapes(
+        X_chol.shape[:-2],
+        Cref_chol.shape[:-2],
+    )
+    res = xp.zeros(
+        batch_shape + X_chol.shape[-2:],
+        dtype=X_chol.dtype, device=xpd(X_chol),
+    )
 
-    tri0, tri1 = np.tril_indices(X.shape[-1], -1)
+    tri0, tri1 = tril_indices(X.shape[-1], -1, xp=xp, like=X)
     res[..., tri0, tri1] = X_chol[..., tri0, tri1] - Cref_chol[..., tri0, tri1]
 
-    diag0, diag1 = np.diag_indices(X.shape[-1])
-    res[..., diag0, diag1] = Cref_chol[..., diag0, diag1] * \
-        np.log(X_chol[..., diag0, diag1] / Cref_chol[..., diag0, diag1])
+    diag0, diag1 = diag_indices(X.shape[-1], xp=xp, like=X)
+    res[..., diag0, diag1] = Cref_chol[..., diag0, diag1] * xp.log(
+            X_chol[..., diag0, diag1] / Cref_chol[..., diag0, diag1]
+    )
 
-    X_new = Cref_chol @ ctranspose(res) + res @ Cref_chol.conj().T
+    X_new = (
+        Cref_chol @ ctranspose(res) +
+        res @ ctranspose(Cref_chol)
+    )
 
     return X_new
 
@@ -399,9 +426,12 @@ def log_map_logeuclid(X, Cref):
         <https://ieeexplore.ieee.org/document/10735221>`_
         G. Wagner vom Berg, V. Röhr, D. Platt, B. Blankertz. IEEE TBME, 2024.
     """
-    _check_dimensions(X, Cref)
+    check_matrix_pair(X, Cref, require_square=True)
     logCref = logm(Cref)
-    X_new = ddexpm(logm(X) - logCref, logCref)
+    X_new = ddexpm(
+        logm(X) - logCref,
+        logCref,
+    )
     return X_new
 
 
@@ -448,7 +478,7 @@ def log_map_riemann(X, Cref, C12=False):
         <https://link.springer.com/article/10.1007/s11263-005-3222-z>`_
         X. Pennec, P. Fillard, N. Ayache. IJCV, 2006, 66(1), pp. 41-66.
     """
-    _check_dimensions(X, Cref)
+    check_matrix_pair(X, Cref, require_square=True)
     Cm12 = invsqrtm(Cref)
     X_new = logm(Cm12 @ X @ Cm12)
     if C12:
@@ -492,7 +522,7 @@ def log_map_wasserstein(X, Cref):
         L. Malagò, L. Montrucchio, G. Pistone. Information Geometry, 2018, 1,
         pp. 137–179.
     """
-    _check_dimensions(X, Cref)
+    check_matrix_pair(X, Cref, require_square=True)
     P12 = sqrtm(Cref)
     P12inv = invsqrtm(Cref)
     sqrt_bracket = sqrtm(P12 @ X @ P12)
@@ -576,11 +606,15 @@ def upper(X):
         O. Tuzel, F. Porikli, and P. Meer. IEEE Transactions on Pattern
         Analysis and Machine Intelligence, Volume 30, Issue 10, October 2008.
     """
+    xp = get_namespace(X)
     n = X.shape[-1]
     if X.shape[-2] != n:
         raise ValueError("Matrices must be square")
-    idx = np.triu_indices_from(np.empty((n, n)))
-    coeffs = (np.sqrt(2) * np.triu(np.ones((n, n)), 1) + np.eye(n))[idx]
+    idx = triu_indices(n, xp=xp, like=X)
+    idx_no_diag = triu_indices(n, k=1, xp=xp, like=X)
+    coeffs = xp.ones((n, n), dtype=X.real.dtype, device=xpd(X))
+    coeffs[idx_no_diag[0], idx_no_diag[1]] = math.sqrt(2.0)
+    coeffs = coeffs[idx[0], idx[1]]
     T = coeffs * X[..., idx[0], idx[1]]
     return T
 
@@ -609,14 +643,15 @@ def unupper(T):
     -----
     .. versionadded:: 0.4
     """
+    xp = get_namespace(T)
     dims = T.shape
-    n = int((np.sqrt(1 + 8 * dims[-1]) - 1) / 2)
-    X = np.empty((*dims[:-1], n, n), dtype=T.dtype)
-    idx = np.triu_indices_from(np.empty((n, n)))
+    n = int((math.sqrt(1 + 8 * dims[-1]) - 1) / 2)
+    X = xp.zeros((*dims[:-1], n, n), dtype=T.dtype, device=xpd(T))
+    idx = triu_indices(n, xp=xp, like=T)
     X[..., idx[0], idx[1]] = T
-    idx = np.triu_indices_from(np.empty((n, n)), k=1)
-    X[..., idx[0], idx[1]] /= np.sqrt(2)
-    X[..., idx[1], idx[0]] = X[..., idx[0], idx[1]].conj()
+    idx = triu_indices(n, k=1, xp=xp, like=T)
+    X[..., idx[0], idx[1]] /= math.sqrt(2.0)
+    X[..., idx[1], idx[0]] = xp.conj(X[..., idx[0], idx[1]])
     return X
 
 
@@ -682,6 +717,240 @@ def untangent_space(T, Cref, *, metric="riemann"):
     X_ = unupper(T)
     X = exp_map(X_, Cref, metric=metric)
     return X
+
+
+###############################################################################
+
+
+def innerproduct_euclid(X, Y, *args):
+    r"""Euclidean inner product.
+
+    Euclidean inner product :math:`\mathbf{g}`
+    between matrices :math:`\mathbf{X}` and :math:`\mathbf{Y}` is:
+
+    .. math::
+        \mathbf{g}(\mathbf{X}, \mathbf{Y}) = \text{tr}(\mathbf{X}^H \mathbf{Y})
+
+    Parameters
+    ----------
+    X : ndarray, shape (..., n, m)
+        First  matrices.
+    Y : ndarray, shape (..., n, m) | None
+        Second matrices.
+        If None, Y is set to X, giving the squared norm of X.
+
+    Returns
+    -------
+    G : float or ndarray, shape (...,)
+        Euclidean inner product between X and Y.
+
+    Notes
+    -----
+    .. versionadded:: 0.11
+
+    See Also
+    --------
+    innerproduct
+    """
+    if Y is None:
+        Y = X
+    G = _apply_inner_product(X, Y)
+    return G
+
+
+def innerproduct_logeuclid(X, Y, Cref):
+    r"""Log-Euclidean inner product.
+
+    Log-Euclidean inner product :math:`\mathbf{g}` between
+    symmetric/Hermitian matrices in tangent space :math:`\mathbf{X}`
+    and :math:`\mathbf{Y}` at :math:`\mathbf{C}_\text{ref}` is [1]_:
+
+    .. math::
+        \mathbf{g}_{\mathbf{C}_\text{ref}}(\mathbf{X}, \mathbf{Y}) =
+            \text{tr} \left(
+            [D_{\mathbf{C}_\text{ref}} \log](X)^*
+            [D_{\mathbf{C}_\text{ref}} \log](Y)
+            \right)
+
+    Parameters
+    ----------
+    X : ndarray, shape (..., n, n)
+        First symmetric/Hermitian matrices in tangent space at Cref.
+    Y : ndarray, shape (..., n, n) | None
+        Second symmetric/Hermitian matrices in tangent space at Cref.
+        If None, Y is set to X, giving the squared norm of X.
+    Cref : ndarray, shape (n, n)
+        Reference SPD/HPD matrix.
+
+    Returns
+    -------
+    G : float or ndarray, shape (...,)
+        Log-Euclidean inner product between X and Y.
+
+    Notes
+    -----
+    .. versionadded:: 0.11
+
+    See Also
+    --------
+    innerproduct
+
+    References
+    ----------
+    .. [1] `Geometric means in a novel vector space structure on symmetric
+        positive-definite matrices
+        <https://epubs.siam.org/doi/abs/10.1137/050637996>`_
+        V. Arsigny, P. Fillard, X. Pennec, N. Ayache.
+        SIAM J Matrix Anal Appl, 2007, 29 (1), pp. 328-347
+    """
+    if Y is None:
+        Y = X
+    G = _apply_inner_product(ddlogm(X, Cref), ddlogm(Y, Cref))
+    return G
+
+
+def innerproduct_riemann(X, Y, Cref):
+    r"""Affine-invariant Riemannian inner product.
+
+    Affine-invariant Riemannian inner product :math:`\mathbf{g}` between
+    symmetric/Hermitian matrices in tangent space :math:`\mathbf{X}`
+    and :math:`\mathbf{Y}` at :math:`\mathbf{C}_\text{ref}` is [1]_:
+
+    .. math::
+        \mathbf{g}_{\mathbf{C}_\text{ref}}(\mathbf{X}, \mathbf{Y}) =
+            \text{tr} \left(
+            (\mathbf{C}_\text{ref}^{-1/2} \mathbf{X}
+            \mathbf{C}_\text{ref}^{-1/2})^*
+            \mathbf{C}_\text{ref}^{-1/2} \mathbf{Y}
+            \mathbf{C}_\text{ref}^{-1/2}
+            \right)
+
+    Parameters
+    ----------
+    X : ndarray, shape (..., n, n)
+        First symmetric/Hermitian matrices in tangent space at Cref.
+    Y : ndarray, shape (..., n, n) | None
+        Second symmetric/Hermitian matrices in tangent space at Cref.
+        If None, Y is set to X, giving the squared norm of X.
+    Cref : ndarray, shape (n, n)
+        Reference SPD/HPD matrix.
+
+    Returns
+    -------
+    G : float or ndarray, shape (...,)
+        Affine-invariant Riemannian inner product between X and Y.
+
+    Notes
+    -----
+    .. versionadded:: 0.11
+
+    See Also
+    --------
+    innerproduct
+
+    References
+    ----------
+    .. [1] `A metric for covariance matrices
+        <https://www.ipb.uni-bonn.de/pdfs/Forstner1999Metric.pdf>`_
+        W. Förstner & B. Moonen.
+        Geodesy-the Challenge of the 3rd Millennium, 2003
+    """
+    if Y is None:
+        Y = X
+    Cm12 = invsqrtm(Cref)
+    G = _apply_inner_product(Cm12 @ X @ Cm12, Cm12 @ Y @ Cm12)
+    return G
+
+
+def _apply_inner_product(X, Y):
+    # product G = trace(X^H @ Y)
+    G = np.einsum("...nm,...nm->...", X.conj(), Y, optimize=True).real
+
+    if G.size == 1:
+        return G.item()
+    else:
+        return G
+
+
+innerproduct_functions = {
+    "euclid": innerproduct_euclid,
+    "logeuclid": innerproduct_logeuclid,
+    "riemann": innerproduct_riemann,
+}
+
+
+def innerproduct(X, Y, Cref, metric="riemann"):
+    r"""Inner product according to a specified metric.
+
+    It calculates the inner product between matrices in the tangent space
+    :math:`\mathbf{X}` and :math:`\mathbf{Y}` at :math:`\mathbf{C}_\text{ref}`,
+    according to a specified metric.
+
+    Parameters
+    ----------
+    X : ndarray, shape (..., n, n)
+        First matrices in tangent space at Cref.
+    Y : ndarray, shape (..., n, n) | None
+        Second matrices in tangent space at Cref.
+        If None, Y is set to X, giving the squared norm of X.
+    Cref : ndarray, shape (n, n) | None
+        Reference matrix.
+    metric : string | callable, default="riemann"
+        Metric used for inner product, can be:
+        "euclid", "logeuclid", "riemann", or a callable function.
+
+    Returns
+    -------
+    G : float or ndarray, shape (...,)
+        Inner product between X and Y.
+
+    Notes
+    -----
+    .. versionadded:: 0.11
+
+    See Also
+    --------
+    innerproduct_euclid
+    innerproduct_logeuclid
+    innerproduct_riemann
+    """
+    innerproduct_function = check_function(metric, innerproduct_functions)
+    G = innerproduct_function(X, Y, Cref)
+    return G
+
+
+def norm(X, Cref, metric="riemann"):
+    r"""Norm according to a specified metric.
+
+    It calculates the norm of the matrix :math:`\mathbf{X}`
+    in the tangent space at :math:`\mathbf{C}_\text{ref}`,
+    according to a specified metric.
+
+    Parameters
+    ----------
+    X : ndarray, shape (..., n, n)
+        Matrices in the tangent space at Cref.
+    Cref : ndarray, shape (n, n) | None
+        Reference matrix.
+    metric : string | callable, default="riemann"
+        Metric used for norm, can be:
+        "euclid", "logeuclid", "riemann", or a callable function.
+
+    Returns
+    -------
+    N : float or ndarray, shape (...,)
+        Norm of X.
+
+    Notes
+    -----
+    .. versionadded:: 0.11
+
+    See Also
+    --------
+    innerproduct
+    """
+    N2 = innerproduct(X, None, Cref, metric=metric)
+    return np.sqrt(N2)
 
 
 ###############################################################################
@@ -758,24 +1027,28 @@ def transport_logchol(X, A, B):
         <https://arxiv.org/pdf/1908.09326>`_
         Z. Lin. SIAM J Matrix Anal Appl, 2019, 40(4), pp. 1353-1370.
     """
-    A_chol, B_chol = np.linalg.cholesky(A), np.linalg.cholesky(B)
-    A_invchol = np.linalg.inv(A_chol)
+    xp = get_namespace(X, A, B)
+    A_chol = xp.linalg.cholesky(A)
+    B_chol = xp.linalg.cholesky(B)
+    eye_n = xp.eye(A.shape[-1], dtype=A.dtype, device=xpd(A))
+    A_invchol = xp.linalg.solve(A_chol, eye_n)
 
-    tri0, tri1 = np.tril_indices(X.shape[-1], -1)
-    diag0, diag1 = np.diag_indices(X.shape[-1])
+    tri0, tri1 = tril_indices(X.shape[-1], -1, xp=xp, like=X)
+    diag0, diag1 = diag_indices(X.shape[-1], xp=xp, like=X)
 
-    P = A_invchol @ X @ A_invchol.conj().T
-    P12 = np.zeros_like(P)
+    P = A_invchol @ X @ ctranspose(A_invchol)
+    P12 = xp.zeros_like(P)
     P12[..., tri0, tri1] = P[..., tri0, tri1]
     P12[..., diag0, diag1] = P[..., diag0, diag1] / 2
     X_ = A_chol @ P12
 
-    T = np.zeros_like(X)
+    T = xp.zeros_like(X)
     T[..., tri0, tri1] = X_[..., tri0, tri1]
     T[..., diag0, diag1] = B_chol[..., diag0, diag1] \
         / A_chol[..., diag0, diag1] * X_[..., diag0, diag1]
 
-    X_new = B_chol @ ctranspose(T) + T @ B_chol.conj().T
+    X_new = B_chol @ ctranspose(T) + \
+        T @ ctranspose(B_chol)
     return X_new
 
 
@@ -826,7 +1099,10 @@ def transport_logeuclid(X, A, B):
         <https://www.sciencedirect.com/science/article/pii/S0024379522004360>`_
         Y. Thanwerdas & X. Pennec. Linear Algebra and its Applications, 2023.
     """
-    return ddexpm(ddlogm(X, A), logm(B))
+    return ddexpm(
+        ddlogm(X, A),
+        logm(B),
+    )
 
 
 def transport_riemann(X, A, B):
@@ -879,12 +1155,13 @@ def transport_riemann(X, A, B):
         <https://optml.mit.edu/papers/sra_hosseini_gopt.pdf>`_
         S. Sra and R. Hosseini. SIAM Journal on Optimization, 2015.
     """
-    # BA^{-1} is not sym => use sqrtm from scipy
+    # BA^{-1} is not sym => use sqrtm from scipy:
     # E = scipy.linalg.sqrtm(B @ np.linalg.inv(A))
     # (BA^{-1})^{1/2} = A^{1/2} (A^{-1/2}BA^{-1/2})^{1/2} A^{-1/2}
-    A12, A12inv = sqrtm(A), invsqrtm(A)
+    A12 = sqrtm(A)
+    A12inv = invsqrtm(A)
     E = A12 @ sqrtm(A12inv @ B @ A12inv) @ A12inv
-    X_new = E @ X @ E.conj().T
+    X_new = E @ X @ ctranspose(E)
     return X_new
 
 

@@ -1,8 +1,10 @@
 import numpy as np
+from numpy.testing import assert_array_equal, assert_array_almost_equal
 import pytest
-from pytest import approx
+from conftest import approx
 
 from pyriemann.spatialfilters import Whitening
+from pyriemann.utils._backend import get_namespace, xpd as device
 from pyriemann.utils.distance import distance_riemann
 from pyriemann.utils.mean import mean_riemann
 from pyriemann.utils.tangentspace import (
@@ -22,13 +24,18 @@ from pyriemann.utils.tangentspace import (
     unupper,
     tangent_space,
     untangent_space,
+    innerproduct,
+    innerproduct_euclid,
+    innerproduct_logeuclid,
+    innerproduct_riemann,
+    norm,
     transport,
     transport_euclid,
     transport_logchol,
     transport_logeuclid,
     transport_riemann,
 )
-from pyriemann.utils.test import is_hermitian
+from pyriemann.utils.test import is_hermitian, is_real
 
 metrics = ["euclid", "logchol", "logeuclid", "riemann", "wasserstein"]
 
@@ -47,17 +54,30 @@ metrics = ["euclid", "logchol", "logeuclid", "riemann", "wasserstein"]
         log_map_wasserstein
     ]
 )
-def test_maps_ndarray(fmap, get_mats):
-    """Test log and exp maps"""
-    n_matrices, n_channels = 6, 3
-    X = get_mats(n_matrices, n_channels, "spd")
-    Xt = fmap(X, np.eye(n_channels))
-    assert Xt.shape == (n_matrices, n_channels, n_channels)
+@pytest.mark.numpy_only
+def test_maps_broadcasting(fmap, get_mats):
+    n_dim5, n_dim4, n_matrices, n_channels = 2, 6, 5, 3
+    X = get_mats([n_dim5, n_dim4, n_matrices], n_channels, "spd")
+    Cref = get_mats(1, n_channels, "spd")[0]
 
-    n_sets = 2
-    X_4d = np.asarray([X for _ in range(n_sets)])
-    Xt = fmap(X_4d, np.eye(n_channels))
-    assert Xt.shape == (n_sets, n_matrices, n_channels, n_channels)
+    # 2D array
+    F2 = fmap(X[0, 0, 0], Cref)
+    assert F2.shape == (n_channels, n_channels)
+
+    # 3D array
+    F3 = fmap(X[0, 0], Cref)
+    assert F3.shape == (n_matrices, n_channels, n_channels)
+    assert F3[0] == approx(F2)
+
+    # 4D array
+    F4 = fmap(X[0], Cref)
+    assert F4.shape == (n_dim4, n_matrices, n_channels, n_channels)
+    assert F4[0, 0] == approx(F2)
+
+    # 5D array
+    F5 = fmap(X, Cref)
+    assert F5.shape == (n_dim5, n_dim4, n_matrices, n_channels, n_channels)
+    assert F5[0, 0, 0] == approx(F2)
 
 
 @pytest.mark.parametrize("kind", ["spd", "hpd"])
@@ -112,25 +132,27 @@ def test_upper_and_unupper(kind, get_mats):
     """Test upper then unupper should be identity"""
     n_matrices, n_channels = 7, 3
     X = get_mats(n_matrices, n_channels, kind)
+    xp = get_namespace(X)
     assert unupper(upper(X)) == approx(X)
 
     n_sets = 2
-    X_4d = np.asarray([X for _ in range(n_sets)])
+    X_4d = xp.stack([X] * n_sets, axis=0)
     assert unupper(upper(X_4d)) == approx(X_4d)
 
 
 @pytest.mark.parametrize("metric", metrics)
-def test_tangent_space_ndarray(metric, get_mats):
-    """Test tangent space projection"""
-    n_matrices, n_channels = 6, 3
+def test_tangent_space_broadcasting(metric, get_mats):
+    n_matrices, n_channels = 5, 3
     n_ts = (n_channels * (n_channels + 1)) // 2
     X = get_mats(n_matrices, n_channels, "spd")
-    Xts = tangent_space(X, np.eye(n_channels), metric=metric)
+    xp = get_namespace(X)
+    eye = xp.eye(n_channels, dtype=X.dtype, device=device(X))
+    Xts = tangent_space(X, eye, metric=metric)
     assert Xts.shape == (n_matrices, n_ts)
 
     n_sets = 2
-    X_4d = np.asarray([X for _ in range(n_sets)])
-    Xts = tangent_space(X_4d, np.eye(n_channels), metric=metric)
+    X_4d = xp.stack([X] * n_sets, axis=0)
+    Xts = tangent_space(X_4d, eye, metric=metric)
     assert Xts.shape == (n_sets, n_matrices, n_ts)
 
 
@@ -138,25 +160,29 @@ def test_tangent_space_ndarray(metric, get_mats):
 def test_tangent_space_riemann_properties(kind, get_mats):
     n_channels = 3
     A, B = get_mats(2, n_channels, kind)
+    xp = get_namespace(A)
 
     # equivalent definitions of Riemannian distance, Eq(7) in [Barachant2012]
     dist = distance_riemann(A, B)
     s = tangent_space(A, B, metric="riemann")
-    assert dist == approx(np.linalg.norm(s))
+    assert dist == approx(
+        float(xp.linalg.vector_norm(xp.reshape(s, (-1,))))
+    )
 
 
 @pytest.mark.parametrize("metric", metrics)
-def test_untangent_space_ndarray(metric, get_mats):
-    """Test untangent space projection"""
+def test_untangent_space_broadcasting(metric, get_mats):
     n_matrices, n_channels = 10, 3
     n_ts = (n_channels * (n_channels + 1)) // 2
     T = get_mats(n_matrices, [n_ts], "real")
-    X = untangent_space(T, np.eye(n_channels), metric=metric)
+    xp = get_namespace(T)
+    eye = xp.eye(n_channels, dtype=T.dtype, device=device(T))
+    X = untangent_space(T, eye, metric=metric)
     assert X.shape == (n_matrices, n_channels, n_channels)
 
     n_sets = 2
-    T_4d = np.asarray([T for _ in range(n_sets)])
-    X = untangent_space(T_4d, np.eye(n_channels), metric=metric)
+    T_4d = xp.stack([T] * n_sets, axis=0)
+    X = untangent_space(T_4d, eye, metric=metric)
     assert X.shape == (n_sets, n_matrices, n_channels, n_channels)
 
 
@@ -172,6 +198,191 @@ def test_tangent_and_untangent_space(kind, metric, get_mats):
     assert X_ut == approx(X)
 
 
+###############################################################################
+
+metrics = ["euclid", "logeuclid", "riemann"]
+
+
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_build(metric, get_mats):
+    n_matrices, n_channels = 5, 3
+    X = get_mats(n_matrices, n_channels, "sym")
+    Y = get_mats(n_matrices, n_channels, "sym")
+    Cref = get_mats(1, n_channels, "spd")[0]
+    K = innerproduct(X, Y, Cref, metric=metric)
+    assert_array_equal(K, globals()[f"innerproduct_{metric}"](X, Y, Cref))
+
+
+def test_innerproduct_metric_string_error(get_mats):
+    n_matrices, n_channels = 5, 3
+    X = get_mats(n_matrices, n_channels, "sym")
+    with pytest.raises(ValueError):
+        innerproduct(X, X, X[0], metric="foo")
+
+
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_input_dimension_error(metric, get_mats):
+    n_matrices, n_channels = 5, 3
+    X = get_mats(n_matrices, n_channels, "sym")
+    Y = get_mats(n_matrices, n_channels + 1, "sym")
+    Cref = get_mats(1, n_channels + 2, "spd")[0]
+    with pytest.raises(ValueError):
+        innerproduct(X, Y, Cref, metric=metric)
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_x_x(kindX, kindC, metric, get_mats):
+    """Test innerproduct for X = Y"""
+    n_matrices, n_channels = 5, 3
+    X = get_mats(n_matrices, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+    G = innerproduct(X, X, Cref, metric=metric)
+    assert G.shape == (n_matrices,)
+    assert is_real(G)
+
+    G1 = innerproduct(X, None, Cref, metric=metric)
+    assert_array_equal(G, G1)
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_x_y(kindX, kindC, metric, get_mats):
+    """Test innerproduct for different X and Y"""
+    n_matrices, n_channels = 4, 3
+    X = get_mats(n_matrices, n_channels, kindX)
+    Y = get_mats(n_matrices, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+    G = innerproduct(X, Y, Cref, metric=metric)
+    assert G.shape == (n_matrices,)
+    assert is_real(G)
+
+
+@pytest.mark.parametrize(
+    "finnerproduct",
+    [
+        innerproduct_euclid,
+        innerproduct_logeuclid,
+        innerproduct_riemann,
+    ],
+)
+def test_innerproduct_ndarray(finnerproduct, get_mats):
+    n_matrices, n_channels = 5, 3
+    A = get_mats(n_matrices, n_channels, "sym")
+    B = get_mats(n_matrices, n_channels, "sym")
+    Cref = get_mats(1, n_channels, "spd")[0]
+
+    assert isinstance(finnerproduct(A[0], B[0], Cref), float)  # 2D arrays
+
+    assert finnerproduct(A, B, Cref).shape == (n_matrices,)  # 3D arrays
+
+    n_sets = 4
+    C = np.asarray([A for _ in range(n_sets)])
+    D = np.asarray([B for _ in range(n_sets)])
+    assert finnerproduct(C, D, Cref).shape == (n_sets, n_matrices)  # 4D arrays
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_property_conjsymmetry(kindX, kindC, metric, get_mats):
+    n_matrices, n_channels = 5, 2
+    X = get_mats(n_matrices, n_channels, kindX)
+    Y = get_mats(n_matrices, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+    G1 = innerproduct(X, Y, Cref, metric=metric)
+    G2 = innerproduct(Y, X, Cref, metric=metric)
+    assert_array_almost_equal(G1.conj(), G2)
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_property_linearity(kindX, kindC, metric,
+                                         get_mats, rndstate):
+    n_matrices, n_channels = 4, 3
+    X = get_mats(n_matrices, n_channels, kindX)
+    Y = get_mats(n_matrices, n_channels, kindX)
+    Z = get_mats(n_matrices, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+    a, b = rndstate.uniform(0.01, 0.99, size=2)
+    if kindX == "herm":
+        a_, b_ = rndstate.uniform(0.01, 0.99, size=2)
+        a += 1j * a_
+        b += 1j * b_
+
+    Gxy = innerproduct(X, Y, Cref, metric=metric)
+    Gxz = innerproduct(X, Z, Cref, metric=metric)
+    Gyz = innerproduct(Y, Z, Cref, metric=metric)
+
+    Gaxpbz = innerproduct(a * X + b * Y, Z, Cref, metric=metric)
+    aGxzpbGyz = a.conj() * Gxz + b.conj() * Gyz
+    assert_array_almost_equal(Gaxpbz, aGxzpbGyz.real)
+
+    Gxaypbz = innerproduct(X, a * Y + b * Z, Cref, metric=metric)
+    aGxypbGxz = a * Gxy + b * Gxz
+    assert_array_almost_equal(Gxaypbz, aGxypbGxz.real)
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+@pytest.mark.parametrize("metric", metrics)
+def test_innerproduct_property_pos_def(kindX, kindC, metric, get_mats):
+    n_matrices, n_channels = 5, 3
+    X = get_mats(n_matrices, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+    G = innerproduct(X, None, Cref, metric=metric)
+    assert np.all(G > 0)
+
+
+@pytest.mark.parametrize("kind", ["real", "comp"])
+@pytest.mark.parametrize("n_dim1, n_dim2", [(4, 5), (5, 4)])
+def test_innerproduct_euclid(kind, n_dim1, n_dim2, get_mats):
+    """Euclidean inner-product for non-square matrices"""
+    n_matrices = 3
+    X = get_mats(n_matrices, [n_dim1, n_dim2], kind)
+    Y = get_mats(n_matrices, [n_dim1, n_dim2], kind)
+    G = innerproduct_euclid(X, Y)
+
+    G1 = np.empty((n_matrices,))
+    G2 = np.empty((n_matrices,))
+    for i in range(n_matrices):
+        G1[i] = np.trace(X[i].conj().T @ Y[i]).real
+        G2[i] = np.dot(X[i].conj().flatten(), Y[i].flatten()).real
+    assert_array_almost_equal(G, G1)
+    assert_array_almost_equal(G, G2)
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+def test_innerproduct_riemann(kindX, kindC, get_mats):
+    n_channels = 5
+    X, Y = get_mats(2, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+    G = innerproduct_riemann(X, Y, Cref)
+
+    # Eq(2.6) in [Moakher2005]
+    G1 = np.trace(np.linalg.solve(Cref, X) @ np.linalg.solve(Cref, Y))
+    assert_array_almost_equal(G, G1)
+
+
+@pytest.mark.parametrize("kindX, kindC", [("sym", "spd"), ("herm", "hpd")])
+@pytest.mark.parametrize("metric", metrics)
+def test_norm_properties(kindX, kindC, metric, get_mats):
+    n_channels = 4
+    X, Y = get_mats(2, n_channels, kindX)
+    Cref = get_mats(1, n_channels, kindC)[0]
+
+    nx = norm(X, Cref, metric=metric)
+    assert isinstance(nx, float)
+
+    # positivity
+    assert nx >= 0
+
+    # triangle inequality
+    ny = norm(Y, Cref, metric=metric)
+    assert norm(X + Y, Cref, metric=metric) <= nx + ny
+
+
+###############################################################################
+
+
 @pytest.mark.parametrize("ftransport", [
     transport_euclid,
     transport_logchol,
@@ -181,45 +392,65 @@ def test_tangent_and_untangent_space(kind, metric, get_mats):
 def test_transport_ndarray(ftransport, get_mats):
     n_matrices, n_channels = 7, 3
     X = get_mats(n_matrices, n_channels, "herm")
+    xp = get_namespace(X)
     A, B = get_mats(2, n_channels, "hpd")
 
+    # 2D array
+    T2 = ftransport(X[0], A, B)
+    assert T2.shape == (n_channels, n_channels)
+
+    # 3D array
     X_tr = ftransport(X, A, B)
     assert X_tr.shape == X.shape
 
     n_sets = 2
-    X_4d = np.asarray([X for _ in range(n_sets)])
+    X_4d = xp.stack([X] * n_sets, axis=0)
     X_tr = ftransport(X_4d, A, B)
     assert X_tr.shape == X_4d.shape
 
 
 @pytest.mark.parametrize("kindX, kindAB", [("sym", "spd"), ("herm", "hpd")])
-@pytest.mark.parametrize("ftransport", [
-    transport_logchol,
-    transport_logeuclid,
-    transport_riemann,
+@pytest.mark.parametrize("metric", [
+    "logchol",
+    "logeuclid",
+    "riemann",
 ])
-def test_transport_properties(kindX, kindAB, ftransport, get_mats):
+def test_transport_properties(kindX, kindAB, metric, get_mats, rndstate):
     n_matrices, n_channels = 10, 3
     X = get_mats(n_matrices, n_channels, kindX)
     A, B = get_mats(2, n_channels, kindAB)
 
+    Xt = transport(X, A, B, metric=metric)
+
     # trivial transport
-    assert ftransport(X, A, A) == approx(X)
+    assert transport(X, A, A, metric=metric) == approx(X)
 
     # keep symmetry
-    assert is_hermitian(ftransport(X, A, B))
+    assert is_hermitian(Xt)
 
     # reversibility
-    assert ftransport(ftransport(X, A, B), B, A) == approx(X)
+    assert transport(Xt, B, A, metric=metric) == approx(X)
 
     # linearity
     Y = get_mats(n_matrices, n_channels, kindX)
-    Xt, Yt = ftransport(X, A, B), ftransport(Y, A, B)
-    assert ftransport(X + Y, A, B) == approx(Xt + Yt)
+    a, b = rndstate.uniform(0.01, 0.99, size=2)
+    Yt = transport(Y, A, B, metric=metric)
+    aXtpbYt = transport(a * X + b * Y, A, B, metric=metric)
+    assert aXtpbYt == approx(a * Xt + b * Yt)
+
+    if metric == "logchol":
+        return
+
+    # isometry, ie keep inner product and norm
+    ia = innerproduct(X, Y, A, metric=metric)
+    ib = innerproduct(Xt, Yt, B, metric=metric)
+    assert ia == approx(ib)
+    assert norm(X, A, metric=metric) == approx(norm(Xt, B, metric=metric))
 
 
+@pytest.mark.numpy_only
 def test_transport_riemann_vs_whitening(get_mats):
-    """AIR PT from mean to identity should be equivalent to a whitening"""
+    """AIR PT from mean to identity is equivalent to a whitening"""
     n_matrices, n_channels = 15, 2
     X = get_mats(n_matrices, n_channels, "spd")
 
