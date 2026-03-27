@@ -173,7 +173,7 @@ def kernel_riemann(X, Y=None, *, Cref=None, reg=1e-10):
     Cref : None | ndarray, shape (n, n), default=None
         Reference SPD matrix.
         If None, Cref is calculated as the Riemannian mean of X, see
-        :func:`pyriemann.utils.mean.mean_riemann`.
+        :func:`pyriemann.geometry.mean.mean_riemann`.
     reg : float, default=1e-10
         When Y is None, regularization parameter to mitigate numerical errors
         in kernel matrix estimation, to provide a positive-definite kernel

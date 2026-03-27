@@ -4,7 +4,7 @@ import warnings
 
 import numpy as np
 
-from ..utils.distance import distance
+from ..geometry.distance import distance
 from ..utils.utils import check_weights
 
 
